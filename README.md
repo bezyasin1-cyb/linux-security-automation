@@ -1,168 +1,637 @@
 # linux-security-automation
-def main():
-    parser = argparse.ArgumentParser(
-        description="YOLO resim ve etiketlerini kontrollu sekilde cogaltir."
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
+import random
+
+import cv2
+import numpy as np
+
+
+# Raspberry Pi proje yolu
+PROJECT_DIR = "/home/arda_ucak/yolo_project"
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+
+def transform_bbox(bbox, matrix, width, height):
+    """
+    YOLO etiket koordinatlarini dondurme matrisine gore yeniden hesaplar.
+    """
+    center_x, center_y, box_width, box_height = bbox
+
+    # Normalize koordinatlari piksele cevir.
+    center_x *= width
+    center_y *= height
+    box_width *= width
+    box_height *= height
+
+    corners = np.array(
+        [
+            [center_x - box_width / 2, center_y - box_height / 2],
+            [center_x + box_width / 2, center_y - box_height / 2],
+            [center_x - box_width / 2, center_y + box_height / 2],
+            [center_x + box_width / 2, center_y + box_height / 2],
+        ],
+        dtype=np.float32,
     )
+
+    new_corners = []
+
+    for point in corners:
+        new_x = (
+            matrix[0, 0] * point[0]
+            + matrix[0, 1] * point[1]
+            + matrix[0, 2]
+        )
+
+        new_y = (
+            matrix[1, 0] * point[0]
+            + matrix[1, 1] * point[1]
+            + matrix[1, 2]
+        )
+
+        new_corners.append([new_x, new_y])
+
+    new_corners = np.array(new_corners)
+
+    min_x = max(0.0, float(np.min(new_corners[:, 0])))
+    max_x = min(float(width), float(np.max(new_corners[:, 0])))
+    min_y = max(0.0, float(np.min(new_corners[:, 1])))
+    max_y = min(float(height), float(np.max(new_corners[:, 1])))
+
+    new_width = (max_x - min_x) / width
+    new_height = (max_y - min_y) / height
+    new_center_x = ((min_x + max_x) / 2.0) / width
+    new_center_y = ((min_y + max_y) / 2.0) / height
+
+    return [
+        new_center_x,
+        new_center_y,
+        new_width,
+        new_height,
+    ]
+
+
+def augment_data(image, labels):
+    height, width = image.shape[:2]
+
+    # 1. Dondurme
+    angle = random.uniform(-45, 45)
+
+    matrix = cv2.getRotationMatrix2D(
+        (width // 2, height // 2),
+        angle,
+        1.0,
+    )
+
+    augmented_image = cv2.warpAffine(
+        image,
+        matrix,
+        (width, height),
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+    new_labels = []
+
+    for label in labels:
+        class_id = int(label[0])
+        bbox = label[1:]
+
+        new_bbox = transform_bbox(
+            bbox,
+            matrix,
+            width,
+            height,
+        )
+
+        new_labels.append([class_id] + new_bbox)
+
+    # 2. Yatay veya dikey cevirme
+    flip_probability = random.random()
+    flip_code = None
+
+    if flip_probability < 0.30:
+        flip_code = 1
+    elif flip_probability < 0.60:
+        flip_code = 0
+
+    if flip_code is not None:
+        augmented_image = cv2.flip(
+            augmented_image,
+            flip_code,
+        )
+
+        flipped_labels = []
+
+        for label in new_labels:
+            class_id = label[0]
+            center_x, center_y, box_width, box_height = label[1:]
+
+            if flip_code == 1:
+                center_x = 1.0 - center_x
+            elif flip_code == 0:
+                center_y = 1.0 - center_y
+
+            flipped_labels.append(
+                [
+                    class_id,
+                    center_x,
+                    center_y,
+                    box_width,
+                    box_height,
+                ]
+            )
+
+        new_labels = flipped_labels
+
+    # 3. Parlaklik ve kontrast
+    alpha = random.uniform(0.7, 1.3)
+    beta = random.randint(-35, 35)
+
+    augmented_image = cv2.convertScaleAbs(
+        augmented_image,
+        alpha=alpha,
+        beta=beta,
+    )
+
+    # 4. Bulaniklik
+    if random.random() < 0.40:
+        kernel_size = random.choice([3, 5])
+
+        augmented_image = cv2.GaussianBlur(
+            augmented_image,
+            (kernel_size, kernel_size),
+            0,
+        )
+
+    # Cok kuculen veya kaybolan kutulari sil.
+    final_labels = []
+
+    for label in new_labels:
+        box_width = label[3]
+        box_height = label[4]
+
+        if box_width > 0.015 and box_height > 0.015:
+            final_labels.append(label)
+
+    return augmented_image, final_labels
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description=(
+            "YOLO resim ve etiketlerini kontrollu sekilde cogaltir. "
+            "--apply verilmeden dosya uretilmez."
+        )
+    )
+
     parser.add_argument(
         "--operation",
         required=True,
         choices=["OP125", "OP350", "OP360"],
-        help="Cogaltilacak operasyon",
+        help="Cogaltma yapilacak operasyon. Ornek: OP350",
     )
+
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Bu secenek verilmeden dosya uretilmez.",
+        help="Dosya uretimini gerceklestirir.",
     )
-    args = parser.parse_args()
 
-    # Script: proje/scripts/augment_equal.py konumundaysa
-    project_dir = Path(__file__).resolve().parents[1]
-
-    sinif = input(
-        "Cogaltilacak Sinif Adini Girin (Orn: T29): "
-    ).strip().upper()
-
-    img_dir = project_dir / "operations" / args.operation / sinif
-    lbl_dir = project_dir / "operations" / args.operation / f"{sinif}L"
-
-    print(f"\nOperasyon  : {args.operation}")
-    print(f"Resim yolu: {img_dir}")
-    print(f"Etiket yolu: {lbl_dir}")
-
-    if not img_dir.is_dir() or not lbl_dir.is_dir():
-        print("\nHATA: Gorsel veya etiket klasoru bulunamadi!")
-        return
-
-    image_extensions = {".jpg", ".jpeg", ".png"}
-
-    images = sorted(
-        path
-        for path in img_dir.iterdir()
-        if path.is_file()
-        and path.suffix.lower() in image_extensions
-        and "_aug_" not in path.stem.lower()
+    parser.add_argument(
+        "--multiplier",
+        type=int,
+        default=None,
+        help=(
+            "Her fotograftan kac yeni ornek uretilecegi. "
+            "Verilmezse terminalde sorulur."
+        ),
     )
+
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Onay sorularini atlar.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Tekrarlanabilir rastgelelik degeri.",
+    )
+
+    return parser.parse_args()
+
+
+def ask_confirmation(message):
+    answer = input(f"{message} [e/H]: ").strip().lower()
+
+    return answer in {
+        "e",
+        "evet",
+        "y",
+        "yes",
+    }
+
+
+def find_image_label_pairs(image_directory, label_directory):
+    images = []
+
+    for filename in sorted(os.listdir(image_directory)):
+        image_path = os.path.join(
+            image_directory,
+            filename,
+        )
+
+        if not os.path.isfile(image_path):
+            continue
+
+        extension = os.path.splitext(filename)[1].lower()
+
+        if extension not in IMAGE_EXTENSIONS:
+            continue
+
+        # Daha once uretilen fotograflari tekrar cogaltma.
+        stem = os.path.splitext(filename)[0]
+
+        if "_aug_" in stem.lower():
+            continue
+
+        images.append(image_path)
 
     valid_pairs = []
     missing_labels = []
 
-    for img_path in images:
-        lbl_path = lbl_dir / f"{img_path.stem}.txt"
+    for image_path in images:
+        stem = os.path.splitext(
+            os.path.basename(image_path)
+        )[0]
 
-        if lbl_path.is_file():
-            valid_pairs.append((img_path, lbl_path))
-        else:
-            missing_labels.append(img_path)
-
-    print(f"\nBulunan orijinal resim : {len(images)}")
-    print(f"Eslesen resim/etiket   : {len(valid_pairs)}")
-    print(f"Etiketi olmayan resim  : {len(missing_labels)}")
-
-    for img_path, lbl_path in valid_pairs[:10]:
-        print(f"  OK: {img_path.name} <-> {lbl_path.name}")
-
-    if len(valid_pairs) > 10:
-        print(f"  ... ve {len(valid_pairs) - 10} cift daha")
-
-    if not valid_pairs:
-        print("\nHATA: Eslesen resim ve etiket cifti bulunamadi!")
-        return
-
-    # --apply verilmediyse sadece kontrol yapar.
-    if not args.apply:
-        print("\nDRY-RUN: Hicbir dosya uretilmedi.")
-        print("Uretmek icin komuta --apply ekleyin.")
-        return
-
-    confirmation = input(
-        "\nBulunan resim ve etiketler dogru mu? [e/H]: "
-    ).strip().lower()
-
-    if confirmation not in {"e", "evet", "y", "yes"}:
-        print("Islem iptal edildi.")
-        return
-
-    try:
-        multiplier = int(
-            input("Her fotograftan KACAR TANE yeni turetsin?: ").strip()
+        label_path = os.path.join(
+            label_directory,
+            f"{stem}.txt",
         )
-    except ValueError:
-        print("HATA: Tam sayi girmelisiniz!")
+
+        if os.path.isfile(label_path):
+            valid_pairs.append(
+                (image_path, label_path)
+            )
+        else:
+            missing_labels.append(image_path)
+
+    return images, valid_pairs, missing_labels
+
+
+def read_yolo_labels(label_path):
+    labels = []
+
+    # utf-8-sig Windows BOM karakterini de temizler.
+    with open(
+        label_path,
+        "r",
+        encoding="utf-8-sig",
+    ) as label_file:
+        lines = label_file.readlines()
+
+    for line_number, line in enumerate(lines, start=1):
+        parts = line.strip().split()
+
+        if not parts:
+            continue
+
+        if len(parts) != 5:
+            print(
+                f"UYARI: Gecersiz etiket satiri "
+                f"{label_path}:{line_number}"
+            )
+            continue
+
+        try:
+            values = [
+                float(value)
+                for value in parts
+            ]
+        except ValueError:
+            print(
+                f"UYARI: Sayisal olmayan etiket "
+                f"{label_path}:{line_number}"
+            )
+            continue
+
+        class_id = int(values[0])
+        center_x = values[1]
+        center_y = values[2]
+        box_width = values[3]
+        box_height = values[4]
+
+        if class_id < 0:
+            print(
+                f"UYARI: Gecersiz sinif numarasi "
+                f"{label_path}:{line_number}"
+            )
+            continue
+
+        coordinates = [
+            center_x,
+            center_y,
+            box_width,
+            box_height,
+        ]
+
+        if any(
+            value < 0.0 or value > 1.0
+            for value in coordinates
+        ):
+            print(
+                f"UYARI: Normalize olmayan kutu "
+                f"{label_path}:{line_number}"
+            )
+            continue
+
+        labels.append(
+            [
+                class_id,
+                center_x,
+                center_y,
+                box_width,
+                box_height,
+            ]
+        )
+
+    return labels
+
+
+def find_available_output_paths(
+    source_image_path,
+    image_directory,
+    label_directory,
+    starting_sequence,
+):
+    source_stem = os.path.splitext(
+        os.path.basename(source_image_path)
+    )[0]
+
+    sequence = starting_sequence
+
+    while True:
+        new_stem = (
+            f"{source_stem}_aug_{sequence:03d}"
+        )
+
+        new_image_path = os.path.join(
+            image_directory,
+            f"{new_stem}.jpg",
+        )
+
+        new_label_path = os.path.join(
+            label_directory,
+            f"{new_stem}.txt",
+        )
+
+        if (
+            not os.path.exists(new_image_path)
+            and not os.path.exists(new_label_path)
+        ):
+            return (
+                new_image_path,
+                new_label_path,
+                sequence,
+            )
+
+        sequence += 1
+
+
+def main():
+    args = parse_arguments()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+
+    class_name = input(
+        "Cogaltilacak Sinif Adini Girin "
+        "(Orn: T29): "
+    ).strip().upper()
+
+    if not class_name:
+        print("HATA: Sinif adi bos birakilamaz!")
         return
 
-    if multiplier < 1:
-        print("HATA: Cogaltma sayisi en az 1 olmalidir!")
-        return
-
-    planned_total = len(valid_pairs) * multiplier
-
-    print(
-        f"\nPlan: {len(valid_pairs)} fotograf x "
-        f"{multiplier} = {planned_total} yeni veri"
+    image_directory = os.path.join(
+        PROJECT_DIR,
+        "operations",
+        args.operation,
+        class_name,
     )
 
-    confirmation = input("Uretim baslatilsin mi? [e/H]: ").strip().lower()
+    label_directory = os.path.join(
+        PROJECT_DIR,
+        "operations",
+        args.operation,
+        f"{class_name}L",
+    )
 
-    if confirmation not in {"e", "evet", "y", "yes"}:
-        print("Islem iptal edildi.")
+    print()
+    print(f"Operasyon   : {args.operation}")
+    print(f"Sinif       : {class_name}")
+    print(f"Resim yolu  : {image_directory}")
+    print(f"Etiket yolu : {label_directory}")
+    print()
+
+    if not os.path.isdir(image_directory):
+        print("HATA: Resim klasoru bulunamadi!")
         return
 
+    if not os.path.isdir(label_directory):
+        print("HATA: Etiket klasoru bulunamadi!")
+        return
+
+    images, valid_pairs, missing_labels = (
+        find_image_label_pairs(
+            image_directory,
+            label_directory,
+        )
+    )
+
+    print(f"Bulunan orijinal resim : {len(images)}")
+    print(f"Eslesen resim/etiket   : {len(valid_pairs)}")
+    print(f"Etiketi olmayan resim  : {len(missing_labels)}")
+    print()
+
+    for image_path, label_path in valid_pairs[:10]:
+        print(
+            f"OK: {os.path.basename(image_path)} "
+            f"<-> {os.path.basename(label_path)}"
+        )
+
+    if len(valid_pairs) > 10:
+        remaining = len(valid_pairs) - 10
+
+        print(
+            f"... ve {remaining} eslesen cift daha"
+        )
+
+    if missing_labels:
+        print()
+
+        for image_path in missing_labels[:10]:
+            print(
+                "ETIKET YOK: "
+                f"{os.path.basename(image_path)}"
+            )
+
+    if not valid_pairs:
+        print()
+        print(
+            "HATA: Eslesen resim ve etiket "
+            "cifti bulunamadi!"
+        )
+        return
+
+    # --apply verilmediyse sadece kontrol yap.
+    if not args.apply:
+        print()
+        print("DRY-RUN: Hicbir dosya uretilmedi.")
+        print(
+            "Gercek uretim icin komuta "
+            "--apply ekleyin."
+        )
+        return
+
+    if not args.yes:
+        print()
+
+        if not ask_confirmation(
+            "Bulunan resim ve etiketler dogru mu?"
+        ):
+            print("Islem iptal edildi.")
+            return
+
+    multiplier = args.multiplier
+
+    if multiplier is None:
+        try:
+            multiplier = int(
+                input(
+                    "Her fotograftan KACAR TANE "
+                    "yeni turetsin?: "
+                ).strip()
+            )
+        except ValueError:
+            print(
+                "HATA: Cogaltma miktari "
+                "tam sayi olmalidir!"
+            )
+            return
+
+    if multiplier < 1:
+        print(
+            "HATA: Cogaltma miktari "
+            "en az 1 olmalidir!"
+        )
+        return
+
+    planned_total = (
+        len(valid_pairs) * multiplier
+    )
+
+    print()
+    print(
+        f"URETIM PLANI: {len(valid_pairs)} "
+        f"fotograf x {multiplier} = "
+        f"{planned_total} yeni resim/etiket cifti"
+    )
+
+    if not args.yes:
+        if not ask_confirmation(
+            "Uretim baslatilsin mi?"
+        ):
+            print("Islem iptal edildi.")
+            return
+
     generated = 0
+    skipped = 0
 
-    for src_img_path, src_lbl_path in valid_pairs:
-        img = cv2.imread(str(src_img_path))
+    for source_image_path, source_label_path in valid_pairs:
+        image = cv2.imread(
+            source_image_path
+        )
 
-        if img is None:
-            print(f"UYARI: Resim okunamadi: {src_img_path}")
+        if image is None:
+            print(
+                "UYARI: Resim okunamadi: "
+                f"{source_image_path}"
+            )
+
+            skipped += 1
             continue
 
-        with open(src_lbl_path, "r", encoding="utf-8-sig") as file:
-            lines = file.readlines()
-
-        labels = []
-
-        for line in lines:
-            parts = line.strip().split()
-
-            if len(parts) == 5:
-                labels.append([float(value) for value in parts])
+        labels = read_yolo_labels(
+            source_label_path
+        )
 
         if not labels:
-            print(f"UYARI: Gecerli etiket yok: {src_lbl_path}")
+            print(
+                "UYARI: Gecerli etiket yok: "
+                f"{source_label_path}"
+            )
+
+            skipped += 1
             continue
 
-        sequence = 1
+        next_sequence = 1
 
         for _ in range(multiplier):
-            # Var olan augmentation dosyalarinin ustune yazmaz.
-            while True:
-                new_base = f"{src_img_path.stem}_aug_{sequence:03d}"
-                new_img_path = img_dir / f"{new_base}.jpg"
-                new_lbl_path = lbl_dir / f"{new_base}.txt"
+            augmented_image, augmented_labels = (
+                augment_data(image, labels)
+            )
 
-                if not new_img_path.exists() and not new_lbl_path.exists():
-                    break
-
-                sequence += 1
-
-            aug_img, aug_labels = augment_data(img, labels)
-
-            if not aug_labels:
+            if not augmented_labels:
                 print(
-                    f"UYARI: Donusumden sonra gecerli kutu kalmadi: "
-                    f"{src_img_path.name}"
+                    "UYARI: Donusumden sonra "
+                    "gecerli kutu kalmadi: "
+                    f"{source_image_path}"
                 )
-                sequence += 1
+
+                skipped += 1
                 continue
 
-            if not cv2.imwrite(str(new_img_path), aug_img):
-                print(f"HATA: Resim yazilamadi: {new_img_path}")
+            (
+                output_image_path,
+                output_label_path,
+                used_sequence,
+            ) = find_available_output_paths(
+                source_image_path,
+                image_directory,
+                label_directory,
+                next_sequence,
+            )
+
+            image_written = cv2.imwrite(
+                output_image_path,
+                augmented_image,
+            )
+
+            if not image_written:
+                print(
+                    "HATA: Resim yazilamadi: "
+                    f"{output_image_path}"
+                )
+
+                skipped += 1
                 continue
 
-            with open(new_lbl_path, "w", encoding="utf-8") as file:
-                for label in aug_labels:
-                    file.write(
+            with open(
+                output_label_path,
+                "w",
+                encoding="utf-8",
+            ) as output_label_file:
+                for label in augmented_labels:
+                    output_label_file.write(
                         f"{int(label[0])} "
                         f"{label[1]:.6f} "
                         f"{label[2]:.6f} "
@@ -170,8 +639,24 @@ def main():
                         f"{label[4]:.6f}\n"
                     )
 
-            generated += 1
-            sequence += 1
+            print(
+                f"URETILDI: "
+                f"{os.path.basename(output_image_path)}"
+            )
 
-    print(f"\nISLEM TAMAM!")
-    print(f"{generated} yeni resim/etiket cifti uretildi.")
+            generated += 1
+            next_sequence = used_sequence + 1
+
+    print()
+    print("ISLEM TAMAM!")
+    print(
+        f"{generated} yeni resim/etiket "
+        "cifti uretildi."
+    )
+
+    if skipped:
+        print(f"Atlanan islem: {skipped}")
+
+
+if __name__ == "__main__":
+    main()
